@@ -1,0 +1,574 @@
+/* перед запуском проверить следующие параметры:
+ *  высоту отцепа шара
+ *  разность высот для проверки барометра
+ *  высота раскрытия парашюта
+ *  время отцепа шара
+ *  время выпуска парашюта
+ *  время индикации работы барометра и автопилота - 5 с
+ *  выставить правильные пины на все 
+ *  
+*/
+// подлючение библиотек
+#include "MS5611.h" // для работы датчика
+#include "Wire.h" // для связи с 12С интерфейсом
+#include "math.h"
+#include "SD.h" // для карты памяти
+#include <OneWire.h> // OneWire DS18S20, DS18B20, DS1822 Temperature Example
+#include <Servo.h> // для работы с сервомоторами
+
+#define PIN_CS  53 // выставляем 10 пин под выход на карте памяти
+#define END_OF_ZERO_STAGE 10
+#define END_OF_FIRST_STAGE 11
+#define END_OF_SECOND_STAGE 12
+#define END_OF_THIRD_STAGE 13
+#define END_OF_FOURTH_STAGE 14
+#define END_OF_FIFTH_STAGE 15
+
+const int servo_otcep = 9; // сигнальный пин для серво отцепа
+const int servo_parashut = 6; // сигнальный пин для серво парашюта
+//const int parashut = 0; // сигнальный пин для сервы парашюта
+const int bar = 8; // сигнальный пин для барометра
+const int led = 2; // сигнальный пин для проверки включения автопилота
+const int pito_led = 7; // сигнальный пин для проверки трубки Пито
+const int ldr = 10; // аналоговый пин для фоторезистора
+const int asPin = 8; // аналоговый пин для трубки Пито
+const int sign_of_high_speed = 5; // сигнальный пин для критической скорости планера (сигнал идет на плату нано)
+const int relay_motor = 3; // реле для питание мотора
+const int relay_pitanie_serv = 4; // реле для питание серв планера (крен, тангаж, рыскание)
+int tmp1 = 0; // счетчик для шара
+int tmp2 = 0; // счетчик для парашюта
+int tmp3 = 0; // счетчик для отцепа шара по времени
+int tmp4 = 0; // счетчик для выпуска парашюта по времени
+int res1 = 0; // результат срабатывания серво отцепа
+int res2 = 0; // результат проверки барометра
+int res3 = 0; // результат проверки трубки Пито
+int res4 = 0; // результат проверки включения автопилота
+int res5 = 0; // результат вывода в порт нулевой стадии
+const int alt_otcep = -2; // высота отцепа шара (м)
+const int control_alt = 0.3; // разность высот для контроля барометра (м)
+const int alt_parashut = 10; // высота раскрытия парашюта (м)
+double sea_lev_pres = 0; // инициализация давление на уровне моря (Па)
+int time_otcep = 10*1000; // время отцепа шара (с)
+int time_parashut = 20*1000; // время выпуска парашюта (с)
+double sum_pres = 0; // используется для расчета давления на уровне моря
+int alt_bar = 0; // некая начальная высота планера (для проверки работы барометра)
+unsigned long previousMillis = 0; // используется для сохранения на карту памяти
+int interval = 10*1000; // используется для сохранения на карту памяти
+double asOffsetV = 0.0; // используется для определения давления (трубка Пито)
+double p = 0; // используется для более точного определения давления 
+int light = 800; // значение при котором фоторезистор ловит свет
+int stage = 0; // переменная стадии
+int pos1 = 0; // угол поворота для сервы отцепа
+int pos2 = 0; // угол поворота для сервы парашюта
+double krit_air_speed = 0; // используется для более точного определения критической скорости 
+int alt_first = -2;
+
+MS5611 pr;
+File myFile;
+OneWire  ds(5); 
+Servo myservo1;
+Servo myservo2; 
+
+void setup() 
+{
+  
+   Serial.begin(9600); // выставляем скорость последовательного порта 
+   asOffsetV = analogRead(asPin) * .0047; // определение нуля (трубка Пито)
+   myservo1.attach(servo_otcep); // прикрепляем сигнал сервы к 6 пину (ШИМ)(отцеп)
+   myservo2.attach(servo_parashut); // прикрепляем сигнал сервы к 9 пину (ШИМ) (парашют)
+   pinMode(pito_led,OUTPUT);
+   pinMode(relay_motor,OUTPUT);
+   pinMode(relay_pitanie_serv,OUTPUT);
+   digitalWrite(relay_motor,HIGH); // подготавливаем реле мотора
+   digitalWrite(relay_pitanie_serv,HIGH); // подготавливаем реле для питания серв планера
+   pinMode(sign_of_high_speed, OUTPUT);
+   //pinMode(parashut,OUTPUT);
+   pinMode(led, OUTPUT);
+   pinMode(bar,OUTPUT); 
+   pinMode(PIN_CS, OUTPUT); 
+
+   while(!Serial){;} // ждем включение порта передачи данных
+   pr.begin(); // инициализация для барометра
+
+   if(!SD.begin(PIN_CS)) // проверка на совпадение порта CS на плате с подлюченным портом
+   {                           
+      Serial.println("SD-card not found"); //return;   
+   }
+  
+   myFile = SD.open("planerp.txt",FILE_WRITE); // открываем или создаем файл в режиме записи
+   
+   // проверка на открытие файла для записи
+   if(myFile)
+   {
+      Serial.println("file is open");
+   }   
+   else
+   {
+       Serial.println("file is not open");
+   }
+   
+   // для определения начального уровня высоты
+   for(int i =0; i<10;i++)
+   {
+      sum_pres += pr.readPressure();
+   }
+   sea_lev_pres = sum_pres/10;
+   
+   // для проверки барометра перед стартом (определение нулевого уровня высоты по среднему значению давления)
+   alt_bar = 44330*(1-pow(pr.readPressure()/sea_lev_pres,0.19));  
+   myFile.println(" -----------TOCHKA OTSCHETA------------ ");
+   myFile.println("ALTITUDE                               Temperature: \n ");
+   Serial.println(" -----------TOCHKA OTSCHETA------------ ");
+   Serial.println("ALTITUDE                               Temperature: \n ");
+
+}
+
+void loop()
+{ 
+  // начало 0 стадии
+  // здесь мы делаем стартовую проверку основной аппаратуры
+  // также все ключи связи автопилота с сервами разомкнуты
+  if(res2 == 0 && res3 == 0 && res4 == 0 && res5 == 0)
+  {
+    Serial.println("******ZERO STAGE START********");
+    myFile.println("******ZERO STAGE START********");
+    res5 = 1;
+  }
+  
+  /*Serial.println(" ");
+  Serial.println(millis()/1000); // вернет время с начала работы программы (с)
+*/
+  // переменные для давления и высоты
+  double pres=0.0, alt = 0.0;
+  
+  // перменные для трубки Пито
+  double asVolts = 0.0; 
+  double compVOut = 0.0;
+  double dynPress = 0.0;
+  double airSpeed = 0.0;
+
+  // программа 
+  pres = pr.readPressure();
+  alt = 44330*(1-pow(pres/sea_lev_pres,0.19)); // определяем текущую высоту над начальным уровнем sea_lev_pres
+
+  // вывод в файл инфы о высоте и давлении
+  myFile.print(" "); 
+  myFile.print(alt);
+  myFile.print(" ("); 
+  myFile.print(pres);
+  myFile.print(" Pa) "); 
+
+  // вывод инфы в последовательной порт
+  Serial.print(" "); 
+  Serial.print(alt);
+  Serial.print(" ("); 
+  Serial.print(pres);
+  Serial.print(") "); 
+  
+
+  //определение температуры
+  byte i;
+  byte present = 0;
+  byte type_s;
+  byte data[12];
+  byte addr[8];
+  float celsius;
+  
+  if (!ds.search(addr)) 
+  {
+    ds.reset_search();
+    delay(250);
+    return;
+  }
+
+  switch (addr[0]) 
+  {
+    case 0x10:
+      type_s = 1;
+      break;
+    case 0x28:
+      type_s = 0;
+      break;
+    case 0x22:
+      type_s = 0;
+      break;
+    default:
+      return;
+  } 
+
+  ds.reset();
+  ds.select(addr);
+  ds.write(0x44, 1);
+  
+  //delay(1000); 
+  
+  present = ds.reset();
+  ds.select(addr);    
+  ds.write(0xBE); 
+
+  for ( i = 0; i < 9; i++) 
+  {  
+    data[i] = ds.read();
+  }
+
+  // переводим сырые данные с датчика в температуру по Цельсию 
+  int16_t raw = (data[1] << 8) | data[0];
+  if (type_s) 
+  {
+    raw = raw << 3; 
+    if (data[7] == 0x10)
+    {
+      raw = (raw & 0xFFF0) + 12 - data[6];
+    }
+  } 
+  else 
+  {
+    byte cfg = (data[4] & 0x60);
+    if (cfg == 0x00) raw = raw & ~7;
+    else if (cfg == 0x20) raw = raw & ~3; 
+    else if (cfg == 0x40) raw = raw & ~1; 
+  }
+  celsius = (float)raw / 16.0;
+  
+  myFile.print("                         ");
+  Serial.print("                         ");
+  if(addr[1] == 99)
+  {
+     myFile.print(" peredatchik = ");
+     Serial.print(" peredatchik = ");
+  }
+  else if(addr[1] == 255)
+  {
+     myFile.print(" AKB = ");
+     Serial.print(" AKB =  ");
+  }
+  else if(addr[1] == 112)
+  {
+     myFile.print(" vneshniy = ");
+     Serial.print(" vneshniy = ");
+  }
+ 
+  myFile.print(celsius);
+  Serial.println(celsius);
+  myFile.println("");
+  Serial.println("");
+  
+  // трубка Пито
+  asVolts = analogRead(asPin) * .0047;
+  
+  //myFile.print("Raw reading (V): ");
+  //myFile.println(asVolts);
+
+  //myFile.print("Offset (V): ");
+  //myFile.println(asOffsetV);
+  
+  compVOut = asVolts - asOffsetV;
+  
+  //myFile.print("Reading - Offset (V): ");
+  //myFile.println(compVOut);
+
+  if(compVOut < .005) 
+  {                   
+    compVOut = 0.0;
+  }  
+  dynPress = compVOut * 1000.0;
+    
+  //myFile.print("Dynamic pressure (Pa):  ");
+  //myFile.println(dynPress); 
+
+  // уточняем коснстанту 1,225
+  if(alt >= -10 && alt <= 250) {p = 1.22;}
+  if(alt > 250 && alt <= 500) {p = 1.2;}
+  if(alt > 500 && alt <= 750) {p = 1.17;}
+  if(alt > 750 && alt <= 1000) {p = 1.14;}
+  if(alt > 1000 && alt <= 1500) {p = 1.11;}
+  if(alt > 1500 && alt <= 2000) {p = 1.06;}
+  if(alt > 2000 && alt <= 2500) {p = 1;}
+  if(alt > 2500 && alt <= 3000) {p = 0.96;}
+  if(alt > 3000 && alt <= 3500) {p = 0.91;}
+  if(alt > 3500 && alt <= 4000) {p = 0.86;}
+  if(alt > 4000 && alt <= 4500) {p = 0.82;}
+  if(alt > 4500 && alt <= 5000) {p = 0.78;}
+  if(alt > 5000 && alt <= 6000) {p = 0.74;}
+  if(alt > 6000 && alt <= 7000) {p = 0.66;}
+  if(alt > 7000 && alt <= 8000) {p = 0.59;}
+  if(alt > 8000 && alt <= 9000) {p = 0.53;}
+  if(alt > 9000 && alt <= 10000) {p = 0.47;}
+  if(alt > 10000 && alt <= 12000) {p = 0.41;}
+  if(alt > 12000 && alt <= 14000) {p = 0.31;}
+  if(alt > 14000 && alt <= 16000) {p = 0.23;}
+  if(alt > 16000 && alt <= 18000) {p = 0.17;}
+  if(alt > 18000 && alt <= 20000) {p = 0.12;}
+  if(alt > 20000 && alt <= 22000) {p = 0.088;}
+  if(alt > 22000 && alt <= 24000) {p = 0.064;}
+  if(alt > 24000 && alt <= 26000) {p = 0.034;}
+  if(alt > 26000 && alt <= 28000) {p = 0.025;}
+  if(alt > 28000 && alt <= 30000) {p = 0.018;}
+  
+  airSpeed = sqrt((2 * dynPress)/p); // здесь константу 1,225 сделали переменной   
+
+  myFile.println(); 
+  myFile.print(" Speed (m/s): ");
+  myFile.println(airSpeed);  // m/s 
+  myFile.print(" Speed (km/h): ");
+  myFile.println(airSpeed / 1000 * 3600);  // km/h
+  myFile.println(); 
+
+  Serial.println(); 
+  Serial.print(" Speed (m/s): ");
+  Serial.println(airSpeed);  // m/s 
+  Serial.print(" Speed (km/h): ");
+  Serial.println(airSpeed / 1000 * 3600);  // km/h
+  Serial.println(); 
+  
+  delay(100);
+
+  // проверка работы барометра
+  if(res2 == 0 && abs(alt - alt_bar) >= control_alt)
+  {
+    digitalWrite(bar,HIGH);
+    delay(5000);
+    res2 = 1; 
+    myFile.println("");
+    myFile.println(" proverks barometra DONE ");  
+    Serial.println("");
+    Serial.println(" proverks barometra DONE ");  
+    digitalWrite(bar,LOW);
+  
+  }
+  else
+  {
+    digitalWrite(bar,LOW);
+  }
+
+  // проверка работы трубки Пито
+  if(res3 == 0 && airSpeed >= 6)
+  {
+    digitalWrite(pito_led, HIGH);
+    delay(5000);
+    res3 = 1;
+    myFile.println("");
+    myFile.println(" proverks trubki Pito DONE ");
+    Serial.println("");
+    Serial.println(" proverks trubki Pito DONE ");
+    digitalWrite(pito_led, LOW);
+  }
+  else
+  {
+    digitalWrite(pito_led, LOW);
+  }
+
+  // проверка включения автопилота
+  if (res4 == 0 && analogRead(ldr) > light) 
+  {
+    digitalWrite(led, HIGH);
+    delay(5000);
+    res4 = 1;
+    myFile.println("");
+    myFile.println(" proverka avtopilota DONE ");
+    Serial.println("");
+    Serial.println(" proverka avtopilota DONE ");
+    digitalWrite(led, LOW);
+  }
+  else 
+  {
+    digitalWrite(led, LOW);
+  }
+
+  // конец 0 стадии
+  if(res2 == 1 && res3 == 1 && res4 == 1 && stage == 0)
+  {
+    Serial.println("******ZERO STAGE END********");
+    myFile.println("******ZERO STAGE END********");
+    stage = END_OF_ZERO_STAGE;
+  }
+
+  // начало первой стадии
+  // здесь нужно слушать барометр и по его показаниям определять высоту подъема
+  // если она не срабатывает, то мы просто спустимся на парашюте
+  if(alt >= alt_first && stage == END_OF_ZERO_STAGE)
+  {
+    stage = 1;
+    Serial.println("******FIRST STAGE START********");
+    myFile.println("******FIRST STAGE START********");    
+  }
+
+  // конец первой стадии
+  if(alt >= alt_otcep && stage == 1)
+  {
+    Serial.println("******FIRST STAGE END********");
+    myFile.println("******FIRST STAGE END********");    
+    stage = END_OF_FIRST_STAGE;
+  }
+  
+  // отцеп шара по высоте
+  if(alt>=alt_otcep && res1 == 0)
+  {
+    tmp1++;
+  }
+  else
+  {
+    tmp1=0;
+  }
+  
+  // начало второй стадии
+  // здесь срабатывает серва отцепа от шара
+  // если серва не сработала шар просто будет подниматься пока не лопнет и спустится на парашюте
+  if(tmp1 >=10 && stage == END_OF_FIRST_STAGE)
+  {
+    stage = 2;
+    Serial.println("******SECOND STAGE START********");
+    myFile.println("******SECOND STAGE START********"); 
+    for (pos1 = 0; pos1 <= 90; pos1++)
+    { 
+      myservo1.write(pos1);             
+      delay(15);                      
+    }
+    res1 = 1;
+    myFile.println(" SERVO_OTCEP DONE (HIGH) "); 
+    Serial.println(" SERVO_OTCEP DONE (HIGH) "); 
+    Serial.println("******SECOND STAGE END********");
+    myFile.println("******SECOND STAGE END********"); 
+    stage = END_OF_SECOND_STAGE;
+  }
+
+  // начало 3 стадии передаем управление сервами автопилоту
+  // здесь необходимо подать питание на сервы и следить за флаттером, критической скоростью планера и скоростью спуска планера
+  // если есть флаттер или планер достиг критической скорости набегающего потока ветра, то мы должны переключить управление рулем высоты на ардуино нано и выставить угол по тангажу +10°
+  // если скорость спуска слишком высока (планер падает), то нужно перейти к 5 стадии
+  if(alt > (alt_otcep-500) && stage == END_OF_SECOND_STAGE)
+  {
+    stage = 3;
+    Serial.println("******THIRD STAGE START********");
+    myFile.println("******THIRD STAGE START********"); 
+    digitalWrite(relay_pitanie_serv,LOW);
+    Serial.println(" Podali pitanie na servu ");
+  }
+
+  // уточняем krit_air_speed
+  if(alt >= 0 && alt <= 250) {krit_air_speed = 19.44;}
+  if(alt > 250 && alt <= 500) {krit_air_speed = 19.69;}
+  if(alt > 500 && alt <= 750) {krit_air_speed = 19.95;}
+  if(alt > 750 && alt <= 1000) {krit_air_speed = 20.21;}
+  if(alt > 1000 && alt <= 1500) {krit_air_speed = 20.68;}
+  if(alt > 1500 && alt <= 2000) {krit_air_speed = 21.3;}
+  if(alt > 2000 && alt <= 2500) {krit_air_speed = 21.73;}
+  if(alt > 2500 && alt <= 3000) {krit_air_speed = 22.32;}
+  if(alt > 3000 && alt <= 3500) {krit_air_speed = 22.96;}
+  if(alt > 3500 && alt <= 4000) {krit_air_speed = 23.52;}
+  if(alt > 4000 && alt <= 4500) {krit_air_speed = 24.11;}
+  if(alt > 4500 && alt <= 5000) {krit_air_speed = 24.76;}
+  if(alt > 5000 && alt <= 6000) {krit_air_speed = 26.21;}
+  if(alt > 6000 && alt <= 7000) {krit_air_speed = 27.72;}
+  if(alt > 7000 && alt <= 8000) {krit_air_speed = 29.25;}
+  if(alt > 8000 && alt <= 9000) {krit_air_speed = 31.06;}
+  if(alt > 9000 && alt <= 10000) {krit_air_speed = 33.26;}
+  if(alt > 10000 && alt <= 12000) {krit_air_speed = 38.25;}
+  if(alt > 12000 && alt <= 14000) {krit_air_speed = 44.40;}
+  if(alt > 14000 && alt <= 16000) {krit_air_speed = 51.65;}
+  if(alt > 16000 && alt <= 18000) {krit_air_speed = 61.47;}
+  if(alt > 18000 && alt <= 20000) {krit_air_speed = 71.79;}
+  if(alt > 20000 && alt <= 22000) {krit_air_speed = 84.18;}
+  if(alt > 22000 && alt <= 24000) {krit_air_speed = 99.29;}
+  if(alt > 24000 && alt <= 26000) {krit_air_speed = 115.49;}
+  if(alt > 26000 && alt <= 28000) {krit_air_speed = 134.68;}
+  if(alt > 28000 && alt <= 30000) {krit_air_speed = 158.73;} 
+  
+  // проверка на критическую скорость планера 
+  if(airSpeed >= krit_air_speed && stage == 3)
+  {
+    digitalWrite(sign_of_high_speed,HIGH);
+  }
+  else
+  {
+    digitalWrite(sign_of_high_speed,LOW);
+  }
+
+  // проверка на высокую скорость спуска (падение)
+  /**/
+
+  // начало 4 стадии
+  // высота менее 1500 м и более 500 м, включаем реле мотора
+  if(alt <= 1500 && stage == 3 && alt < 500)
+  {
+    stage = END_OF_THIRD_STAGE;
+    Serial.println("******THIRD STAGE END********");
+    myFile.println("******THIRD STAGE END********"); 
+    stage = 4;
+    Serial.println("******FOURTH STAGE START********");
+    myFile.println("******FOURTH STAGE START********"); 
+    digitalWrite(relay_motor, LOW);
+    Serial.println("");
+    Serial.println(" podali pitanie na motor ");
+    Serial.println("******FOURTH STAGE END********");
+    myFile.println("******FOURTH STAGE END********"); 
+    stage = END_OF_FOURTH_STAGE;
+  }
+
+  
+  /*//отцеп шара по времени
+  if(millis() >= time_otcep && tmp3 <=5 )
+  {
+    digitalWrite(rel,LOW);
+    res1 = 1;
+    myFile.println(" RELAY IS ON (TIME) ");  
+    tmp3++;
+  }*/
+  
+  // выпуск парашюта по высоте
+  if(res1 ==1 && alt <= alt_parashut)
+  { 
+    tmp2++;
+  }
+  else
+  {
+    tmp2=0;
+  }
+  if(tmp2>=10 && stage == END_OF_FOURTH_STAGE)
+  {
+    stage = 5;
+    Serial.println("******FIFTH STAGE START********");
+    myFile.println("******FIFTH STAGE START********"); 
+    for (pos2 = 0; pos2 <= 90; pos2++)
+    { 
+      myservo2.write(pos2);             
+      delay(15);                      
+    }
+    tmp2 = 0;
+    digitalWrite(relay_pitanie_serv, HIGH);
+    Serial.println("");
+    Serial.println(" pitanie serv OFF ");
+    digitalWrite(relay_motor, HIGH);
+    Serial.println(" pitanie motora OFF ");
+    myFile.println(" SERVO_PARASHUT DONE (HIGH) ");  
+    Serial.println(" SERVO_PARASHUT DONE (HIGH) ");
+  }  
+  
+  /*// выпуск парашюта по времени
+  if(millis() >= time_parashut && tmp4 <= 5)
+  {
+    digitalWrite(parashut,HIGH);
+    myFile.println(" PARASHUT is ON (TIME) ");  
+    tmp4++;
+  }*/
+
+  //запись в файл текущено времени 
+  myFile.print("\nTIME: "); 
+  myFile.println(millis()/1000); 
+  myFile.println("-----"); 
+
+  Serial.print("\nTIME: "); 
+  Serial.println(millis()/1000); 
+  Serial.println("-----"); 
+
+  // запись данных из буфера в файл каждые 10 с
+  if ((millis() - previousMillis) >= interval) 
+  { 
+    previousMillis = millis();
+    myFile.flush();
+    Serial.println("--Flush--");
+    myFile.println("--FLUSH--");
+  }
+  
+  delay(500);
+}
